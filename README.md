@@ -8,19 +8,17 @@ Report-3 offsets originated in [Mixxx issue #12886](https://github.com/mixxxdj/m
 
 Linux users need the hidraw ACL from `72-phase.rules` installed under `/etc/udev/rules.d/`, followed by udev rule reload and receiver reconnect. 
 
-Run `node test-phase-mapping.js` to check packet decoding, direction, displayed BPM, stop, track reload, and lost-report behavior without hardware.
-
 ## Wake automatically on receiver connection
 
 Install the user service and udev rule:
 
 ```sh
 install -Dm644 phase-wake.service ~/.config/systemd/user/phase-wake.service
-sudo install -Dm644 72-phase.rules /etc/udev/rules.d/72-phase.rules
 systemctl --user daemon-reload
+sudo install -Dm644 72-phase.rules /etc/udev/rules.d/72-phase.rules
 sudo udevadm control --reload-rules
 ```
 
 Reconnect the receiver while your user session is running. When its HID interface appears, the rule grants hidraw access and asks your user manager to run `phase-wake.service` once. No `systemctl --user enable` is needed: the device triggers the service on each connection. Check the result with `journalctl --user -u phase-wake.service -b`.
 
-The service runs `%h/Workspace/phase/go-phase/go-phase wake`; edit `ExecStart` if your checkout is elsewhere. It only performs the HID handshake; Mixxx still needs the mapping above to read the motion reports.
+The service runs `%h/bin/phase wake`; edit `ExecStart` if your checkout is elsewhere. It only performs the HID handshake; Mixxx still needs the mapping above to read the motion reports.
