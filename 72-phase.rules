@@ -1,2 +1,2 @@
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="00f1", ATTR{idProduct}=="01f1", GROUP="audio", MODE="0660"
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="00f1", ATTRS{idProduct}=="01f1", ENV{ID_USB_INTERFACE_NUM}=="01", GROUP="audio", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="00f1", ATTRS{idProduct}=="01f1", ENV{ID_USB_INTERFACE_NUM}=="01", GROUP="audio", MODE="0660", TAG+="uaccess", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="phase-wake.service"

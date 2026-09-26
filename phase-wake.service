@@ -1,0 +1,7 @@
+[Unit]
+Description=Wake Phase receiver HID streaming
+
+[Service]
+Type=oneshot
+ExecStart=%h/bin/phase wake
+TimeoutStartSec=10s
