@@ -3,20 +3,37 @@
 var PhaseEssential = {};
 
 PhaseEssential.nominalRadiansPerSecond = 2 * Math.PI * (33 + 1 / 3) / 60;
-PhaseEssential.maximumScratchSpeed = 3;
-PhaseEssential.reportTimeoutMs = 500;
-PhaseEssential.deckState = [{ enabled: false }, { enabled: false }];
-PhaseEssential.lastReportAt = 0;
+PhaseEssential.reportTimeoutMs = 200;
+PhaseEssential.stopDelayMs = 80;
+PhaseEssential.bpmUpdateMs = 50;
+PhaseEssential.bpmSmoothingMs = 250;
+PhaseEssential.deckState = [];
+PhaseEssential.trackConnections = [];
 PhaseEssential.watchdog = 0;
 
+PhaseEssential.newDeckState = function() {
+    return { enabled: false, timestamp: null, lastFreshAt: 0, lastPosition: 0,
+        lastMotionAt: 0, lastBpmAt: 0, bpmRate: 1, origin: 0, sampleRate: 0 };
+};
+
 PhaseEssential.init = function(id, debugging) {
-    PhaseEssential.deckState = [{ enabled: false }, { enabled: false }];
-    PhaseEssential.lastReportAt = 0;
+    PhaseEssential.deckState = [PhaseEssential.newDeckState(), PhaseEssential.newDeckState()];
+    PhaseEssential.trackConnections = [];
     PhaseEssential.debugging = debugging;
-    PhaseEssential.watchdog = engine.beginTimer(100, PhaseEssential.checkTimeout);
+    for (var deck = 0; deck < 2; ++deck) {
+        PhaseEssential.trackConnections.push(engine.makeConnection(
+            "[Channel" + (deck + 1) + "]", "track_loaded", PhaseEssential.trackChanged(deck)));
+    }
+    PhaseEssential.watchdog = engine.beginTimer(50, PhaseEssential.checkTimeout);
     if (debugging) {
         print("Phase Essential HID mapping loaded: " + id + "; run go-phase wake after each USB reconnect");
     }
+};
+
+PhaseEssential.trackChanged = function(deck) {
+    return function() {
+        PhaseEssential.releaseDeck(deck);
+    };
 };
 
 PhaseEssential.shutdown = function() {
@@ -27,6 +44,12 @@ PhaseEssential.shutdown = function() {
     for (var deck = 0; deck < 2; ++deck) {
         PhaseEssential.releaseDeck(deck);
     }
+    for (var i = 0; i < PhaseEssential.trackConnections.length; ++i) {
+        if (PhaseEssential.trackConnections[i]) {
+            PhaseEssential.trackConnections[i].disconnect();
+        }
+    }
+    PhaseEssential.trackConnections = [];
 };
 
 PhaseEssential.releaseDeck = function(deck) {
@@ -34,17 +57,20 @@ PhaseEssential.releaseDeck = function(deck) {
         return;
     }
     var group = "[Channel" + (deck + 1) + "]";
-    engine.setValue(group, "scratch2", 0);
-    engine.setValue(group, "scratch2_enable", 0);
-    PhaseEssential.deckState[deck].enabled = false;
+    // Pause before releasing position control, or the deck resumes at its last pitch.
+    engine.setValue(group, "play", 0);
+    engine.setValue(group, "scratch_position_enable", 0);
+    engine.setValue(group, "rate_ratio", 1);
+    PhaseEssential.deckState[deck] = PhaseEssential.newDeckState();
 };
 
 PhaseEssential.checkTimeout = function() {
-    if (PhaseEssential.lastReportAt && Date.now() - PhaseEssential.lastReportAt > PhaseEssential.reportTimeoutMs) {
-        for (var deck = 0; deck < 2; ++deck) {
+    var now = Date.now();
+    for (var deck = 0; deck < 2; ++deck) {
+        var state = PhaseEssential.deckState[deck];
+        if (state.enabled && now - state.lastFreshAt > PhaseEssential.reportTimeoutMs) {
             PhaseEssential.releaseDeck(deck);
         }
-        PhaseEssential.lastReportAt = 0;
     }
 };
 
@@ -71,16 +97,80 @@ PhaseEssential.decodePositionReport = function(data, length) {
         return null;
     }
     return [
-        { position: PhaseEssential.float32LE(data, 1), velocity: PhaseEssential.float32LE(data, 5) },
-        { position: PhaseEssential.float32LE(data, 32), velocity: PhaseEssential.float32LE(data, 36) }
+        { position: PhaseEssential.float32LE(data, 1), velocity: PhaseEssential.float32LE(data, 5),
+            timestamp: PhaseEssential.uint32LE(data, 14) },
+        { position: PhaseEssential.float32LE(data, 32), velocity: PhaseEssential.float32LE(data, 36),
+            timestamp: PhaseEssential.uint32LE(data, 45) }
     ];
 };
 
-PhaseEssential.scratchSpeed = function(velocity) {
-    // Phase reports negative angular velocity for forward playback.
-    var speed = -velocity / PhaseEssential.nominalRadiansPerSecond;
-    return Math.max(-PhaseEssential.maximumScratchSpeed,
-        Math.min(PhaseEssential.maximumScratchSpeed, speed));
+PhaseEssential.uint32LE = function(data, offset) {
+    return ((data[offset] & 255) | ((data[offset + 1] & 255) << 8) |
+        ((data[offset + 2] & 255) << 16) | ((data[offset + 3] & 255) << 24)) >>> 0;
+};
+
+PhaseEssential.updateBpm = function(group, state, speed, now) {
+    if (now - state.lastBpmAt < PhaseEssential.bpmUpdateMs) {
+        return;
+    }
+    var elapsed = now - state.lastBpmAt;
+    state.lastBpmAt = now;
+    // Forward speed only; reverse and a stopped record have no useful BPM.
+    var target = speed > 0.05 && speed < 1.9 ? speed : 1;
+    var alpha = 1 - Math.exp(-elapsed / PhaseEssential.bpmSmoothingMs);
+    state.bpmRate += alpha * (target - state.bpmRate);
+    engine.setValue(group, "rate_ratio", state.bpmRate);
+};
+
+PhaseEssential.updateDeck = function(deck, remote, now) {
+    var state = PhaseEssential.deckState[deck];
+    if (!remote.timestamp || !isFinite(remote.velocity) || !isFinite(remote.position)) {
+        PhaseEssential.releaseDeck(deck);
+        return;
+    }
+    if (remote.timestamp === state.timestamp) {
+        return; // Receiver repeats radio samples between HID reports.
+    }
+    var group = "[Channel" + (deck + 1) + "]";
+    var sampleRate = engine.getValue(group, "track_samplerate");
+    if (!engine.getValue(group, "track_loaded") || !isFinite(sampleRate) || sampleRate <= 0) {
+        PhaseEssential.releaseDeck(deck);
+        return;
+    }
+    if (state.enabled && (sampleRate !== state.sampleRate ||
+            Math.abs(remote.position - state.lastPosition) > 2)) {
+        // A new track format or a radio position reset needs a fresh origin.
+        PhaseEssential.releaseDeck(deck);
+        return;
+    }
+    if (!state.enabled) {
+        state.enabled = true;
+        state.origin = remote.position;
+        state.sampleRate = sampleRate;
+        state.lastBpmAt = now;
+        engine.setValue(group, "scratch_position", 0);
+        engine.setValue(group, "scratch_position_enable", 1);
+    }
+    state.timestamp = remote.timestamp;
+    state.lastFreshAt = now;
+    if (remote.position !== state.lastPosition) {
+        // Mixxx scratch_position uses stereo track samples. Forward Phase angle
+        // decreases, so negate distance; Mixxx feeds back actual playhead travel.
+        engine.setValue(group, "scratch_position",
+            (state.origin - remote.position) * 2 * sampleRate / PhaseEssential.nominalRadiansPerSecond);
+        state.lastPosition = remote.position;
+    }
+    var speed = -remote.velocity / PhaseEssential.nominalRadiansPerSecond;
+    if (Math.abs(speed) > 0.02) {
+        state.lastMotionAt = now;
+        if (!engine.getValue(group, "play")) {
+            engine.setValue(group, "play", 1);
+        }
+    } else if (now - state.lastMotionAt > PhaseEssential.stopDelayMs &&
+            engine.getValue(group, "play")) {
+        engine.setValue(group, "play", 0);
+    }
+    PhaseEssential.updateBpm(group, state, speed, now);
 };
 
 PhaseEssential.incomingData = function(data, length) {
@@ -105,23 +195,8 @@ PhaseEssential.incomingData = function(data, length) {
     if (!remotes) {
         return;
     }
-    PhaseEssential.lastReportAt = Date.now();
+    var now = Date.now();
     for (var deck = 0; deck < 2; ++deck) {
-        var remote = remotes[deck];
-        if (!isFinite(remote.velocity) || !isFinite(remote.position)) {
-            PhaseEssential.releaseDeck(deck);
-            continue;
-        }
-        var group = "[Channel" + (deck + 1) + "]";
-        if (!PhaseEssential.deckState[deck].enabled) {
-            // Zeroed report fields can also mean a remote is absent or charging.
-            // Do not take over an idle deck before any motion is seen.
-            if (Math.abs(remote.velocity) < 0.02) {
-                continue;
-            }
-            engine.setValue(group, "scratch2_enable", 1);
-            PhaseEssential.deckState[deck].enabled = true;
-        }
-        engine.setValue(group, "scratch2", PhaseEssential.scratchSpeed(remote.velocity));
+        PhaseEssential.updateDeck(deck, remotes[deck], now);
     }
 };

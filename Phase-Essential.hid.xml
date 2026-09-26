@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <MixxxControllerPreset schemaVersion="1" mixxxVersion="2.5.0">
     <info>
-        <name>Phase Essential (HID prototype)</name>
+        <name>Phase Essential (HID vinyl control)</name>
         <author>-</author>
-        <description>Two-deck Phase HID position/velocity prototype.</description>
+        <description>Two-deck Phase HID relative vinyl control.</description>
         <devices>
             <product protocol="hid" vendor_id="0x00f1" product_id="0x01f1"
                 interface_number="0x01" usage_page="0xff00" usage="0x01" />
