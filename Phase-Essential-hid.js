@@ -3,25 +3,26 @@
 var PhaseEssential = {};
 
 PhaseEssential.nominalRadiansPerSecond = 2 * Math.PI * (33 + 1 / 3) / 60;
+// Allow fast hand spins. 3x (one revolution in 0.6 s) clipped quick backspins.
+PhaseEssential.maximumScratchSpeed = 12;
 PhaseEssential.reportTimeoutMs = 200;
-PhaseEssential.stopDelayMs = 80;
 PhaseEssential.bpmUpdateMs = 50;
 PhaseEssential.bpmSmoothingMs = 250;
 PhaseEssential.deckState = [];
-PhaseEssential.trackConnections = [];
+PhaseEssential.connections = [];
 PhaseEssential.watchdog = 0;
 
 PhaseEssential.newDeckState = function() {
-    return { enabled: false, timestamp: null, lastFreshAt: 0, lastPosition: 0,
-        lastMotionAt: 0, lastBpmAt: 0, bpmRate: 1, origin: 0, sampleRate: 0 };
+    return { enabled: false, timestamp: null, lastFreshAt: 0,
+        lastBpmAt: 0, bpmRate: 1 };
 };
 
 PhaseEssential.init = function(id, debugging) {
     PhaseEssential.deckState = [PhaseEssential.newDeckState(), PhaseEssential.newDeckState()];
-    PhaseEssential.trackConnections = [];
+    PhaseEssential.connections = [];
     PhaseEssential.debugging = debugging;
     for (var deck = 0; deck < 2; ++deck) {
-        PhaseEssential.trackConnections.push(engine.makeConnection(
+        PhaseEssential.connections.push(engine.makeConnection(
             "[Channel" + (deck + 1) + "]", "track_loaded", PhaseEssential.trackChanged(deck)));
     }
     PhaseEssential.watchdog = engine.beginTimer(50, PhaseEssential.checkTimeout);
@@ -44,12 +45,12 @@ PhaseEssential.shutdown = function() {
     for (var deck = 0; deck < 2; ++deck) {
         PhaseEssential.releaseDeck(deck);
     }
-    for (var i = 0; i < PhaseEssential.trackConnections.length; ++i) {
-        if (PhaseEssential.trackConnections[i]) {
-            PhaseEssential.trackConnections[i].disconnect();
+    for (var i = 0; i < PhaseEssential.connections.length; ++i) {
+        if (PhaseEssential.connections[i]) {
+            PhaseEssential.connections[i].disconnect();
         }
     }
-    PhaseEssential.trackConnections = [];
+    PhaseEssential.connections = [];
 };
 
 PhaseEssential.releaseDeck = function(deck) {
@@ -57,9 +58,10 @@ PhaseEssential.releaseDeck = function(deck) {
         return;
     }
     var group = "[Channel" + (deck + 1) + "]";
-    // Pause before releasing position control, or the deck resumes at its last pitch.
+    // Pause before releasing scratch2, or ordinary playback resumes at its last pitch.
     engine.setValue(group, "play", 0);
-    engine.setValue(group, "scratch_position_enable", 0);
+    engine.setValue(group, "scratch2", 0);
+    engine.setValue(group, "scratch2_enable", 0);
     engine.setValue(group, "rate_ratio", 1);
     PhaseEssential.deckState[deck] = PhaseEssential.newDeckState();
 };
@@ -109,16 +111,25 @@ PhaseEssential.uint32LE = function(data, offset) {
         ((data[offset + 2] & 255) << 16) | ((data[offset + 3] & 255) << 24)) >>> 0;
 };
 
+PhaseEssential.scratchSpeed = function(velocity) {
+    // The transport sees raw signed Phase speed; UI smoothing never touches audio.
+    var speed = -velocity / PhaseEssential.nominalRadiansPerSecond;
+    return Math.max(-PhaseEssential.maximumScratchSpeed,
+        Math.min(PhaseEssential.maximumScratchSpeed, speed));
+};
+
 PhaseEssential.updateBpm = function(group, state, speed, now) {
     if (now - state.lastBpmAt < PhaseEssential.bpmUpdateMs) {
         return;
     }
     var elapsed = now - state.lastBpmAt;
     state.lastBpmAt = now;
-    // Forward speed only; reverse and a stopped record have no useful BPM.
-    var target = speed > 0.05 && speed < 1.9 ? speed : 1;
+    // Hold the last meaningful forward pitch through stops and reverse scratches.
+    if (speed <= 0.05 || speed >= 1.9) {
+        return;
+    }
     var alpha = 1 - Math.exp(-elapsed / PhaseEssential.bpmSmoothingMs);
-    state.bpmRate += alpha * (target - state.bpmRate);
+    state.bpmRate += alpha * (speed - state.bpmRate);
     engine.setValue(group, "rate_ratio", state.bpmRate);
 };
 
@@ -132,44 +143,20 @@ PhaseEssential.updateDeck = function(deck, remote, now) {
         return; // Receiver repeats radio samples between HID reports.
     }
     var group = "[Channel" + (deck + 1) + "]";
-    var sampleRate = engine.getValue(group, "track_samplerate");
-    if (!engine.getValue(group, "track_loaded") || !isFinite(sampleRate) || sampleRate <= 0) {
-        PhaseEssential.releaseDeck(deck);
-        return;
-    }
-    if (state.enabled && (sampleRate !== state.sampleRate ||
-            Math.abs(remote.position - state.lastPosition) > 2)) {
-        // A new track format or a radio position reset needs a fresh origin.
+    if (!engine.getValue(group, "track_loaded")) {
         PhaseEssential.releaseDeck(deck);
         return;
     }
     if (!state.enabled) {
         state.enabled = true;
-        state.origin = remote.position;
-        state.sampleRate = sampleRate;
         state.lastBpmAt = now;
-        engine.setValue(group, "scratch_position", 0);
-        engine.setValue(group, "scratch_position_enable", 1);
+        engine.setValue(group, "scratch2", 0);
+        engine.setValue(group, "scratch2_enable", 1);
     }
     state.timestamp = remote.timestamp;
     state.lastFreshAt = now;
-    if (remote.position !== state.lastPosition) {
-        // Mixxx scratch_position uses stereo track samples. Forward Phase angle
-        // decreases, so negate distance; Mixxx feeds back actual playhead travel.
-        engine.setValue(group, "scratch_position",
-            (state.origin - remote.position) * 2 * sampleRate / PhaseEssential.nominalRadiansPerSecond);
-        state.lastPosition = remote.position;
-    }
-    var speed = -remote.velocity / PhaseEssential.nominalRadiansPerSecond;
-    if (Math.abs(speed) > 0.02) {
-        state.lastMotionAt = now;
-        if (!engine.getValue(group, "play")) {
-            engine.setValue(group, "play", 1);
-        }
-    } else if (now - state.lastMotionAt > PhaseEssential.stopDelayMs &&
-            engine.getValue(group, "play")) {
-        engine.setValue(group, "play", 0);
-    }
+    var speed = PhaseEssential.scratchSpeed(remote.velocity);
+    engine.setValue(group, "scratch2", speed);
     PhaseEssential.updateBpm(group, state, speed, now);
 };
 
