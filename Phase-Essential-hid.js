@@ -6,6 +6,9 @@ PhaseEssential.nominalRadiansPerSecond = 2 * Math.PI * (33 + 1 / 3) / 60;
 // Allow fast hand spins. 3x (one revolution in 0.6 s) clipped quick backspins.
 PhaseEssential.maximumScratchSpeed = 12;
 PhaseEssential.reportTimeoutMs = 200;
+PhaseEssential.stopDelayMs = 2000;
+// Ignore tiny velocity noise for play-state detection only; audio stays unfiltered.
+PhaseEssential.movementThreshold = 0.001;
 PhaseEssential.bpmUpdateMs = 50;
 PhaseEssential.bpmSmoothingMs = 250;
 PhaseEssential.deckState = [];
@@ -13,7 +16,7 @@ PhaseEssential.connections = [];
 PhaseEssential.watchdog = 0;
 
 PhaseEssential.newDeckState = function() {
-    return { enabled: false, timestamp: null, lastFreshAt: 0,
+    return { enabled: false, timestamp: null, lastFreshAt: 0, stationarySince: null,
         lastBpmAt: 0, bpmRate: 1 };
 };
 
@@ -72,6 +75,12 @@ PhaseEssential.checkTimeout = function() {
         var state = PhaseEssential.deckState[deck];
         if (state.enabled && now - state.lastFreshAt > PhaseEssential.reportTimeoutMs) {
             PhaseEssential.releaseDeck(deck);
+        } else if (state.enabled && state.stationarySince !== null &&
+                now - state.stationarySince >= PhaseEssential.stopDelayMs) {
+            var group = "[Channel" + (deck + 1) + "]";
+            if (engine.getValue(group, "play")) {
+                engine.setValue(group, "play", 0);
+            }
         }
     }
 };
@@ -157,6 +166,14 @@ PhaseEssential.updateDeck = function(deck, remote, now) {
     state.lastFreshAt = now;
     var speed = PhaseEssential.scratchSpeed(remote.velocity);
     engine.setValue(group, "scratch2", speed);
+    if (Math.abs(speed) > PhaseEssential.movementThreshold) {
+        state.stationarySince = null;
+        if (!engine.getValue(group, "play")) {
+            engine.setValue(group, "play", 1);
+        }
+    } else if (state.stationarySince === null) {
+        state.stationarySince = now;
+    }
     PhaseEssential.updateBpm(group, state, speed, now);
 };
 
